@@ -25,3 +25,14 @@ Homepage = "https://github.com/Antlera/EDiT"
 
 [tool.setuptools]
 packages = ["edit", "edit.cache", "edit.cache.policies"]
+
+# Pull torch from the CUDA 12.8 wheel index (uv only). The default PyPI torch is
+# built for CUDA 13.0, which needs a newer NVIDIA driver than CUDA-12.8 setups
+# have. Bump to cu130/cu126/etc. to match your own driver if different.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }

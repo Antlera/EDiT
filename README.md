@@ -1,6 +1,9 @@
 <div align="center">
 
-<img src="./assets/edit-logo.png" width="400" alt="EDiT logo" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="./assets/edit-logo-dark.png" />
+  <img src="./assets/edit-logo.png" width="400" alt="EDiT logo" />
+</picture>
 
 ### A Lightweight, Editable Inference Engine for Diffusion Transformers (DiTs)
 

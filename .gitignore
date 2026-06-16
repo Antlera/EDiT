@@ -17,6 +17,7 @@ uv.lock
 *.png
 !assets/edit-icon.png
 !assets/edit-logo.png
+!assets/edit-logo-dark.png
 *.gif
 output*/
 outputs/
