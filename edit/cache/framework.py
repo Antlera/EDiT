@@ -189,6 +189,29 @@ class CachedUnit(nn.Module):
     def _store_get(self, slot):
         return self.controller.store.get(self._key(slot))
 
+    def prefetch(self, slot="res") -> None:
+        """Stage this unit's cached tensor (current gen/branch) toward the GPU ahead
+        of a reuse read, so the swap-in overlaps compute. No-op unless the store
+        offloads. See CacheController.prefetch_unit to stage another gen/branch."""
+        self.controller.store.prefetch(self._key(slot))
+
+    def _reuse_residual(self):
+        """The residual to reconstruct from on a skip: this generation's own residual
+        if present, else a blend (mean) of the reuse-window generations' residuals for
+        this (unit, branch). Returns None if nothing is available (=> recompute)."""
+        own = self._store_get("res")
+        if own is not None:
+            return own
+        ctrl = self.controller
+        parts = []
+        for g in ctrl.reuse_window:
+            r = ctrl.store.get((g, self.index, ctrl.branch, "res"))
+            if r is not None:
+                parts.append(r)
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else torch.stack(parts).mean(0)
+
     def _record_history(self, st, residual, e0) -> None:
         store = self.controller.store
         store.put(self._key(("hist", st.cnt, "res")), residual)
@@ -222,9 +245,11 @@ class CachedUnit(nn.Module):
         compute = policy.should_compute(ctx)
 
         # Try the skip path only when the policy allows it AND a residual is actually
-        # in the store (it may have been evicted under a capacity budget — then we
-        # fall through and recompute, which is always safe).
-        residual = None if compute else store.get(self._key("res"))
+        # available (it may have been evicted under a capacity budget — then we fall
+        # through and recompute, which is always safe). When this generation has no
+        # residual yet (e.g. a new segment's first touch of the unit), fall back to
+        # the reuse window — the previous segment(s)' residual — for a warm start.
+        residual = None if compute else self._reuse_residual()
 
         if residual is not None:
             ctx.last_residual = residual
@@ -259,6 +284,7 @@ class CacheController:
         self.e_base = None                    # base time embedding e, captured per forward
         self.units: list[CachedUnit] = []
         self.num_units = 0
+        self.reuse_window: list = []          # prior gen_ids to warm-start this segment from
 
     def set_branch(self, name: str) -> None:
         self.branch = name
@@ -267,6 +293,30 @@ class CacheController:
         """Tag subsequent forwards with a generation id (part of every store key),
         so several generations can coexist in one store for continual generation."""
         self.gen_id = gen_id
+
+    def set_reuse_window(self, gen_ids) -> None:
+        """Prior generations a new segment may warm-start from when it has no residual
+        of its own yet (cross-segment reuse). The skip path blends (means) whichever of
+        these are still cached; prefetch_reuse() stages them ahead of the forward."""
+        self.reuse_window = list(gen_ids)
+
+    def prefetch_reuse(self, branches=("cond", "uncond")) -> None:
+        """Stage every reuse-window generation's residual, for every unit and branch,
+        toward the GPU — so the warm-start reads during the next forward overlap
+        compute instead of stalling it on CPU/NVMe swap-in. Call right before pipe()."""
+        for g in self.reuse_window:
+            for b in branches:
+                for u in self.units:
+                    self.store.prefetch((g, u.index, b, "res"))
+
+    def prefetch_unit(self, unit_index, *, branch=None, gen_id=None, slot="res") -> None:
+        """Stage one unit's cached tensor toward the GPU ahead of a reuse read, so the
+        copy / disk read overlaps compute. branch and gen_id default to the current
+        ones; pass them explicitly to warm-start the next segment from a previous
+        generation's residuals (the cross-segment reuse case). Safe if absent/evicted."""
+        b = self.branch if branch is None else branch
+        g = self.gen_id if gen_id is None else gen_id
+        self.store.prefetch((g, unit_index, b, slot))
 
     def reset(self, *, clear_store: bool = True) -> None:
         """Clear control state for a fresh generation. With clear_store=False the

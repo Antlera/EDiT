@@ -22,8 +22,31 @@
 import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
+
+# --- async prefetch machinery -------------------------------------------------- #
+# A single side stream carries offload H2D copies so they overlap default-stream
+# compute; a small thread pool carries blocking disk reads (torch.load releases the
+# GIL during file I/O) so they overlap too. Both are created lazily on first use so
+# importing this module never touches CUDA.
+_PREFETCH_STREAM = None
+_IO_POOL = None
+
+
+def _prefetch_stream():
+    global _PREFETCH_STREAM
+    if _PREFETCH_STREAM is None:
+        _PREFETCH_STREAM = torch.cuda.Stream()
+    return _PREFETCH_STREAM
+
+
+def _io_pool():
+    global _IO_POOL
+    if _IO_POOL is None:
+        _IO_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cache-io")
+    return _IO_POOL
 
 
 class CacheStore(ABC):
@@ -53,8 +76,12 @@ class CacheStore(ABC):
         """Drop every key for which predicate(key) is True (e.g. one generation)."""
         raise NotImplementedError
 
-    @property
-    def bytes_resident(self) -> int:
+    def prefetch(self, key) -> None:
+        """Hint that `key` will be read soon: begin staging it toward the GPU OFF the
+        critical path. A later get(key) returns the staged tensor, blocking only if
+        the transfer has not finished. Default: a no-op (e.g. GPUStore — already
+        resident). Offloading stores override this to overlap the copy / disk read
+        with compute. Issuing prefetch for an absent/evicted key is harmless."""
         """Approximate bytes currently held — instrumentation for storage research."""
         return 0
 
@@ -79,6 +106,7 @@ class KeyedTensorStore(CacheStore):
         self._bytes = 0
         self._evictions = 0
         self.capacity_bytes = capacity_bytes
+        self._inflight: dict = {}                   # key -> staged prefetch (set by subclasses)
 
     # ---- subclass hooks ---------------------------------------------------- #
     def _encode(self, tensor):
@@ -113,12 +141,14 @@ class KeyedTensorStore(CacheStore):
         return self._decode(payload)
 
     def drop(self, key) -> None:
+        self._inflight.pop(key, None)             # cancel any pending stage for this key
         payload = self._data.pop(key, None)
         if payload is not None:
             self._bytes -= self._nbytes(payload)
             self._free(payload)
 
     def clear(self) -> None:
+        self._inflight.clear()
         for payload in self._data.values():
             self._free(payload)
         self._data.clear()
@@ -184,6 +214,32 @@ class CPUOffloadStore(KeyedTensorStore):
         cpu, _ = payload
         return cpu.element_size() * cpu.nelement()
 
+    def prefetch(self, key) -> None:
+        if key in self._inflight or key not in self._data:
+            return
+        cpu, device = self._data[key]
+        self._data.move_to_end(key)
+        stream = _prefetch_stream()
+        with torch.cuda.stream(stream):           # H2D on the side stream...
+            gpu = cpu.to(device, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record(stream)                         # ...flagged complete by this event
+        # keep `cpu` referenced until the async copy is consumed (no use-after-free)
+        self._inflight[key] = (gpu, ev, cpu)
+
+    def get(self, key):
+        staged = self._inflight.pop(key, None)
+        if staged is not None:
+            gpu, ev, _cpu = staged
+            torch.cuda.current_stream().wait_event(ev)   # order compute after the copy
+            self._data.move_to_end(key)
+            return gpu
+        payload = self._data.get(key)
+        if payload is None:
+            return None
+        self._data.move_to_end(key)
+        return self._decode(payload)
+
 
 class DiskOffloadStore(KeyedTensorStore):
     """Offload cached tensors to disk (NVMe) — the deepest tier.
@@ -213,6 +269,32 @@ class DiskOffloadStore(KeyedTensorStore):
         path, _, device = payload
         return torch.load(path, map_location="cpu").to(device)
 
+    @staticmethod
+    def _read_pinned(path):
+        cpu = torch.load(path, map_location="cpu")    # blocking file read (worker thread)
+        return cpu.pin_memory() if not cpu.is_pinned() else cpu
+
+    def prefetch(self, key) -> None:
+        if key in self._inflight or key not in self._data:
+            return
+        path, _, device = self._data[key]
+        self._data.move_to_end(key)
+        # The slow part — the disk read — runs in a worker thread, overlapping compute.
+        self._inflight[key] = (_io_pool().submit(self._read_pinned, path), device)
+
+    def get(self, key):
+        item = self._inflight.pop(key, None)
+        if item is not None:
+            fut, device = item
+            cpu = fut.result()                        # wait for the (overlapped) disk read
+            self._data.move_to_end(key)
+            return cpu.to(device, non_blocking=True)  # small H2D from pinned, stream-ordered
+        payload = self._data.get(key)
+        if payload is None:
+            return None
+        self._data.move_to_end(key)
+        return self._decode(payload)
+
     def _nbytes(self, payload) -> int:
         return payload[1]
 
@@ -236,6 +318,10 @@ class TieredStore(CacheStore):
                      (DiskOffloadStore(), None)])         # cold: unbounded, on NVMe
 
     A CPU tier can sit in between for a 3-level GPU -> RAM -> NVMe hierarchy.
+
+    prefetch(key) routes to the holding tier so a soon-to-be-read residual is staged
+    toward the GPU off the critical path (the copy / disk read overlaps compute); the
+    later get(key) then blocks only on whatever transfer has not yet finished.
     """
 
     def __init__(self, tiers, *, promote: bool = True):
@@ -314,6 +400,15 @@ class TieredStore(CacheStore):
             self._tbytes[0] += nb
             self._spill_overflow()
         return tensor
+
+    def prefetch(self, key) -> None:
+        """Stage `key` toward the GPU from whatever tier holds it (no-op if it is
+        already on the GPU tier, absent, or evicted). Does not change placement —
+        promotion still happens on the eventual get()."""
+        loc = self._loc.get(key)
+        if loc is None:
+            return
+        self.tiers[loc[0]].prefetch(key)
 
     def drop(self, key) -> None:
         loc = self._loc.pop(key, None)

@@ -147,6 +147,7 @@ class EditWanPipeline:
         max_sequence_length: int = 512,
         callback_on_step=None,
         reset_cache: bool = True,
+        prefetch_reuse: bool = False,
     ):
         device = self.device
         transformer_dtype = self.dtype
@@ -184,6 +185,10 @@ class EditWanPipeline:
             cache.configure_steps(num_inference_steps)
             if reset_cache:
                 cache.reset()
+            # Cross-segment reuse: stage the reuse window toward the GPU now, so the
+            # warm-start swap-in overlaps this forward instead of stalling it.
+            if prefetch_reuse and cache.reuse_window:
+                cache.prefetch_reuse(("cond", "uncond") if do_cfg else ("cond",))
 
         # 5. Denoising loop (explicit)
         for i, t in enumerate(timesteps):
