@@ -20,6 +20,9 @@ dependencies = [
     "imageio-ffmpeg",
 ]
 
+[project.optional-dependencies]
+viz = ["matplotlib"]   # tests/plot_tiered_longrun.py (long-run cache figures)
+
 [project.urls]
 Homepage = "https://github.com/Antlera/EDiT"
 
