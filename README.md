@@ -32,6 +32,7 @@ The first target is single-GPU Wan text-to-video: the code leans on [diffusers](
 
 ## 📢 Updates
 
+- **[2026-06]** Tiered cache (GPU → CPU → NVMe) with **async prefetch** and **cross-segment reuse** — [bounded-VRAM long-video generation](#prefetch-reuse) whose swap-in overlaps compute.
 - **[2026-06]** Pluggable cache-policy framework: choose a **policy** (when to skip), a **granularity** (stack / per-block / grouped), and a **store** (GPU / CPU-offload / disk) independently.
 - **[2026-06]** Initial release — single-GPU Wan2.1 text-to-video with TeaCache and First-Block-Cache, and bit-for-bit parity with the no-cache path.
 
@@ -42,6 +43,8 @@ The first target is single-GPU Wan text-to-video: the code leans on [diffusers](
 - 🎬 **Single-GPU Wan T2V** inference on top of diffusers components.
 - ⏭️ **Step-skipping policies** — TeaCache and First-Block-Cache out of the box.
 - 🧱 **Editable cache storage** at stack-level, per-block, or grouped-block granularity.
+- ♾️ **Tiered cache (GPU → CPU → NVMe)** with per-tier budgets + LRU spill — [continual generation that never OOMs](#run-forever).
+- 🎞️ **Async prefetch + cross-segment reuse** — [long-video swap-in overlaps compute](#prefetch-reuse), so bounded-VRAM runs stay near in-VRAM speed.
 - 🔍 **Explicit denoising loop** with callback hooks and live cache statistics.
 - 🎯 **Bit-for-bit parity** with the no-cache path when skipping is disabled.
 
@@ -136,6 +139,72 @@ Cached vs. uncached Wan2.1-T2V-1.3B runs on a single GPU. See [bench.py](bench.p
 
 > Skipped steps still run the non-block work around the transformer stack — patch embedding, RoPE, conditioning, output normalization, and unpatchifying. Here that fixed work is about **17%** of a full transformer forward, which bounds the practical speedup.
 
+<a id="run-forever"></a>
+
+### ♾️ Run forever: tiered cache storage (GPU → CPU → NVMe)
+
+The feature cache lives behind a pluggable [`CacheStore`](edit/cache/store.py). A `TieredStore` cascades **GPU → CPU (RAM) → NVMe** by a per-tier byte budget: new residuals land on the GPU, and when a tier is over budget its least-recently-used entries *spill down* to the next tier. Bound every tier and the **total footprint is fixed forever** — the oldest generations are evicted (and safely recomputed on demand), so a continual run never OOMs.
+
+<p align="center">
+  <img src="assets/tiered_longrun.gif" width="92%">
+</p>
+
+A long continual run (fresh `gen_id` each generation, **192 MB of fresh cache per generation**, tiers bounded at GPU ≤ 384 MB → CPU ≤ 768 MB → NVMe ≤ 2304 MB):
+
+<p align="center">
+  <img src="assets/tiered_mem.png" width="49%">
+  <img src="assets/tiered_cost.png" width="49%">
+</p>
+
+| Gen | GPU MB | CPU MB | NVMe MB | Total | Move ms/gen |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2 | 384 | 0 | 0 | 384 | ~1 |
+| 4 | 384 | 384 | 0 | 768 | ~95 |
+| 7 | 384 | 768 | 192 | 1344 | ~80 |
+| 12 | 384 | 768 | 1152 | 2304 | ~80 |
+| 19 | 384 | 768 | 2304 | 3456 | ~80 |
+| 30 | 384 | 768 | 2304 | 3456 | ~80 |
+
+**Left:** each tier pins at its bound; the overflow rides down to NVMe and the total stays capped — CPU engages at gen 3, NVMe at gen 7, eviction kicks in at gen 19, after which the footprint is flat indefinitely. **Right:** the price of depth — one residual's `put`+`get` round trip is ~free on the GPU (a reference), **~0.45 ms** on CPU (one H2D/D2H copy), and **~5.7 ms** on NVMe (a file write + read). Deeper tiers trade latency for capacity, and since `get` returning `None` is always safe (the unit just recomputes), eviction can never corrupt a run.
+
+```bash
+python tests/bench_tiered_longrun.py   # measure → tests/tiered_longrun_data.json
+python tests/plot_tiered_longrun.py    # render → assets/tiered_{mem,cost}.png + tiered_longrun.gif
+```
+
+<a id="prefetch-reuse"></a>
+
+### 🎞️ Long video: cross-segment reuse with async prefetch
+
+Deeper tiers cost latency on read — but that read is **hideable**. `store.prefetch(key)` stages a soon-to-be-reused residual toward the GPU off the critical path (CPU copies ride a side CUDA stream; NVMe reads ride a thread pool), so a later `get()` only waits on whatever transfer has not finished. For continual long-video generation, the `warmstart_reuse` policy warm-starts each segment from a window of previous segments, and the pipeline prefetches that window ahead of the forward — so the CPU/NVMe swap-in overlaps compute instead of stalling it.
+
+```python
+pipe.enable_cache(
+    policy="warmstart_reuse",            # TeaCache + warm-start the first steps from the window
+    num_inference_steps=steps, store=tiered_store, warm_steps=2, wan_variant="t2v-1.3B",
+)
+cache = pipe.cache
+for g in range(num_segments):            # one long video, segment by segment
+    cache.set_generation(g)
+    cache.set_reuse_window(range(max(0, g - 4), g))   # warm-start from the last 4 segments
+    cache.reset(clear_store=False)                    # keep the cache across segments
+    pipe(prompt=..., reset_cache=False, prefetch_reuse=True)   # stage the window → overlap
+```
+
+Real Wan2.1-T2V-1.3B, 8 segments, reuse window 4, feature cache bounded at GPU ≤ 120 MB → CPU ≤ 120 MB → NVMe (unbounded); VRAM stays flat at the model footprint the whole run:
+
+| | Steady-state s/segment |
+| --- | ---: |
+| prefetch **off** (synchronous swap-in) | 9.95 s |
+| prefetch **on** (swap-in overlaps compute) | **8.89 s** |
+
+Prefetch hid ≈1 s/segment of CPU/NVMe swap-in here. Because a real Wan forward (seconds) dwarfs a residual read (ms), staging the reuse window ahead makes bounded-VRAM long-video generation run at essentially the in-VRAM speed.
+
+```bash
+python tests/real_reuse.py             # real-model A/B: prefetch off vs on
+python tests/test_reuse.py             # mechanism check: cross-segment reuse + prefetch are exact
+```
+
 <a id="how-it-works"></a>
 
 ## 🧩 How It Works
@@ -198,6 +267,8 @@ The policy context exposes `step`, `num_steps`, `branch`, `unit_index`, `num_uni
 | [example.py](example.py) | Minimal Wan text-to-video generation. |
 | [examples/wan_t2v_teacache.py](examples/wan_t2v_teacache.py) | TeaCache run script. |
 | [examples/custom_cache_policy.py](examples/custom_cache_policy.py) | Custom policy template. |
+| [tests/bench_tiered_longrun.py](tests/bench_tiered_longrun.py) | Tiered-cache long-run monitor (memory per tier + cost of depth). |
+| [tests/real_reuse.py](tests/real_reuse.py) | Long-video cross-segment reuse with async prefetch (real Wan A/B). |
 
 <a id="acknowledgements"></a>
 

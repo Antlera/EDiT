@@ -18,9 +18,17 @@ uv.lock
 !assets/edit-icon.png
 !assets/edit-logo.png
 !assets/edit-logo-dark.png
+!assets/tiered_mem.png
+!assets/tiered_cost.png
 *.gif
+!assets/tiered_longrun.gif
 output*/
 outputs/
+
+# Benchmark artifacts
+.nano_cache*/
+*.log
+tests/tiered_longrun_data.json
 
 # Caches / editor
 .pytest_cache/
