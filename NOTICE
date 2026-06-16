@@ -1,0 +1,15 @@
+nano-xDiT
+Copyright 2026 nano-xDiT contributors
+
+This product includes software derived from xDiT (https://github.com/xdit-project/xDiT),
+licensed under the Apache License, Version 2.0.
+
+The TeaCache / First-Block-Cache step-skipping logic is adapted from:
+  - TeaCache    (https://github.com/ali-vilab/TeaCache),    Apache License 2.0
+  - ParaAttention (https://github.com/chengzeyi/ParaAttention), via xDiT
+
+The official Wan2.1 TeaCache polynomial coefficients reproduced in
+nano_xdit/cache/wan_adapter.py are taken from the ali-vilab/TeaCache project.
+
+nano-xDiT targets single-GPU Wan video-DiT inference and removes all of xDiT's
+distributed / sequence-parallel machinery.

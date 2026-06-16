@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Generated media / outputs
+*.mp4
+*.png
+!assets/edit-icon.png
+!assets/edit-logo.png
+*.gif
+output*/
+outputs/
+
+# Caches / editor
+.pytest_cache/
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store

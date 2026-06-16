@@ -1,0 +1,11 @@
+# EDiT: single-GPU Wan video DiT inference + TeaCache/FBCache.
+# Tested with torch 2.7 + CUDA on an RTX PRO 6000 (Blackwell).
+torch>=2.4
+diffusers>=0.35
+transformers>=4.49
+accelerate>=0.34
+ftfy
+numpy
+# video export in example.py
+imageio
+imageio-ffmpeg
